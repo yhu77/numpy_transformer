@@ -26,17 +26,26 @@ class MultiheadAttention:
         self.n_heads = n_heads
         self.depth = d_model // n_heads
 
-        # Projection matrices
         self.Wq = np.random.randn(d_model, d_model) / np.sqrt(d_model)
         self.Wk = np.random.randn(d_model, d_model) / np.sqrt(d_model)
         self.Wv = np.random.randn(d_model, d_model) / np.sqrt(d_model)
         self.Wo = np.random.randn(d_model, d_model) / np.sqrt(d_model)
 
-        # Bias terms for projections (not strictly necessary, but closer to standard impls)
         self.bq = np.zeros((d_model,))
         self.bk = np.zeros((d_model,))
         self.bv = np.zeros((d_model,))
         self.bo = np.zeros((d_model,))
+
+        self.dWq = np.zeros_like(self.Wq)
+        self.dWk = np.zeros_like(self.Wk)
+        self.dWv = np.zeros_like(self.Wv)
+        self.dWo = np.zeros_like(self.Wo)
+
+        self.dbq = np.zeros_like(self.bq)
+        self.dbk = np.zeros_like(self.bk)
+        self.dbv = np.zeros_like(self.bv)
+        self.dbo = np.zeros_like(self.bo)
+
 
     def split_heads(self, x):
         """
@@ -194,16 +203,6 @@ class MultiheadAttention:
         self.dWo[...] = 0
         self.dbo[...] = 0
 
-        self.d_context = 0
-        self.d_context_split = 0
-        self.d_attn = 0
-        self.d_V_split = 0
-        self.d_score = 0
-        self.d_Q_raw = 0
-        self.d_K_raw = 0
-        self.d_V_raw = 0
-
-
     def update(self, lr):
         self.Wq -= lr * self.dWq
         self.bq -= lr * self.dbq
@@ -360,47 +359,115 @@ class Encoder:
 class Decoder:
     def __init__(self, d_model, n_heads, d_ff):
         self.d_model = d_model
-        self.n_heads = n_heads
-        self.d_ff = d_ff
 
         self.self_attention = MultiheadAttention(d_model, n_heads)
-        self.encoder_decoder_attention = MultiheadAttention(d_model, n_heads)
+        self.ln1 = LayerNorm(d_model)
+
+        self.cross_attention = MultiheadAttention(d_model, n_heads)
+        self.ln2 = LayerNorm(d_model)
+
         self.ff = FeedForward(d_model, d_ff)
+        self.ln3 = LayerNorm(d_model)
 
-    def forward(self, x, encoder_output, src_mask=None, tgt_mask=None):
-        """
-        x: (batch_size, tgt_seq_len, d_model)
-        encoder_output: (batch_size, src_seq_len, d_model)
 
-        src_mask:
-            - mask over encoder positions (for encoder-decoder attention)
+    def forward(self, x, enc_out, src_mask=None, tgt_mask=None):
+        # ----- Block 1: masked self-attention -----
+        sa_out, _ = self.self_attention.forward(x, x, x, tgt_mask)
+        x_sa = x + sa_out
+        y1 = self.ln1.forward(x_sa)
 
-        tgt_mask:
-            - mask over decoder positions (for causal/self-attention)
-            - If None, a causal mask is created so that position i cannot
-              attend to positions > i.
-        """
-        batch_size, tgt_seq_len, _ = x.shape
+        # ----- Block 2: cross-attention (query = decoder, key/value = encoder) -----
+        ca_out, attn = self.cross_attention.forward(y1, enc_out, enc_out, src_mask)
+        y1_ca = y1 + ca_out
+        y2 = self.ln2.forward(y1_ca)
 
-        # If no target mask is provided, create a causal one
-        if tgt_mask is None:
-            tgt_mask = create_causal_mask(tgt_seq_len, batch_size, self.self_attention.n_heads)
+        # ----- Block 3: FFN -----
+        ff_out = self.ff.forward(y2)
+        y2_ff = y2 + ff_out
+        y3 = self.ln3.forward(y2_ff)
 
-        # 1) Decoder self-attention (with causal mask)
-        x_hat, _ = self.self_attention.forward(x, x, x, tgt_mask)
-        x = layer_norm(x + x_hat)
+        # Cache for backward
+        self.cache = {
+            "x": x,
+            "x_sa": x_sa,
+            "y1": y1,
+            "y1_ca": y1_ca,
+            "y2": y2,
+            "y2_ff": y2_ff,
+            "enc_out": enc_out,
+            "attn": attn,
+            "src_mask": src_mask,
+            "tgt_mask": tgt_mask,
+        }
 
-        # 2) Encoder-decoder cross attention
-        x_hat, attention_weights = self.encoder_decoder_attention.forward(
-            x, encoder_output, encoder_output, src_mask
-        )
-        x = layer_norm(x + x_hat)
+        return y3, attn
+    
+    def backward(self, d_out):
+        # ---------- Block 3: Feed Forward block ----------
+        # LN3 backward
+        dy2_ff = self.ln3.backward(d_out)
 
-        # 3) Feed-forward + residual + LN
-        x_hat = self.ff.forward(x)
-        x = layer_norm(x + x_hat)
+        # residual split
+        d_y2_from_residual3 = dy2_ff
+        d_ff_out = dy2_ff
 
-        return x, attention_weights
+        # FF backward
+        dy2_from_ff = self.ff.backward(d_ff_out)
+
+        # sum residuals
+        dy2 = d_y2_from_residual3 + dy2_from_ff
+
+
+        # ---------- Block 2: Cross Attention block ----------
+        # LN2 backward
+        dy1_ca = self.ln2.backward(dy2)
+
+        # residual split
+        d_y1_from_residual2 = dy1_ca
+        d_ca_out = dy1_ca
+
+        # cross-attention backward
+        dy1_from_ca = self.cross_attention.backward(d_ca_out)
+
+        # sum residuals
+        dy1 = d_y1_from_residual2 + dy1_from_ca
+
+
+        # ---------- Block 1: Masked Self Attention block ----------
+        # LN1 backward
+        dx_sa = self.ln1.backward(dy1)
+
+        # residual split
+        d_x_from_residual1 = dx_sa
+        d_sa_out = dx_sa
+
+        # masked self-attention backward
+        d_x_from_sa = self.self_attention.backward(d_sa_out)
+
+        # final gradient to input
+        dx = d_x_from_residual1 + d_x_from_sa
+
+        return dx
+    
+    def zero_grad(self):
+        self.self_attention.zero_grad()
+        self.cross_attention.zero_grad()
+        self.ff.zero_grad()
+        self.ln1.zero_grad()
+        self.ln2.zero_grad()
+        self.ln3.zero_grad()
+
+    def update(self, lr):
+        self.self_attention.update(lr)
+        self.cross_attention.update(lr)
+        self.ff.update(lr)
+        self.ln1.update(lr)
+        self.ln2.update(lr)
+        self.ln3.update(lr)
+
+
+
+
     
 # ======== Linear ========
 class Linear:
