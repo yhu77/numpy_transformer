@@ -6,13 +6,6 @@ def softmax(x):
     exp_x = np.exp(x - np.max(x, axis=-1, keepdims=True))
     return exp_x / np.sum(exp_x, axis=-1, keepdims=True)
 
-
-def layer_norm(x, eps=1e-6):
-    mean = np.mean(x, axis=-1, keepdims=True)
-    std = np.std(x, axis=-1, keepdims=True)
-    return (x - mean) / (std + eps)
-
-
 def create_causal_mask(seq_len, batch_size=1, n_heads=1):
     """
     Create a causal mask of shape (1, 1, seq_len, seq_len) that can be
@@ -54,19 +47,15 @@ class MultiheadAttention:
         return np.transpose(x, (0, 2, 1, 3))
 
     def forward(self, query, key, value, mask=None):
-        """
-        query, key, value: (batch_size, seq_len, d_model)
 
-        mask:
-            - Can be shape (batch_size, n_heads, seq_len_q, seq_len_k)
-              or broadcastable to that shape.
-            - True / 1  => keep position
-            - False / 0 => mask out (set score to -inf before softmax)
-        """
         # Linear projections + bias
         Q = np.dot(query, self.Wq) + self.bq
         K = np.dot(key, self.Wk) + self.bk
         V = np.dot(value, self.Wv) + self.bv
+
+        Q_raw = Q.copy()
+        K_raw = K.copy()
+        V_raw = V.copy()
 
         # Split into heads
         Q = self.split_heads(Q)
@@ -92,15 +81,138 @@ class MultiheadAttention:
             score = np.where(mask, score, -1e9)
 
         attention_weights = softmax(score)
-        context = np.matmul(attention_weights, V)  # (batch, heads, seq_q, depth)
-
-        # Combine heads
-        context = np.transpose(context, (0, 2, 1, 3))  # (batch, seq_q, heads, depth)
+        context_split = np.matmul(attention_weights, V)  # (batch, heads, seq_q, depth)
+        context = np.transpose(context_split, (0, 2, 1, 3))  # (batch, seq_q, heads, depth)
         context = np.reshape(context, (context.shape[0], -1, self.d_model))  # (batch, seq_q, d_model)
 
         out = np.dot(context, self.Wo) + self.bo  # (batch, seq_q, d_model)
 
+        batch_size = query.shape[0]
+        seq_len = query.shape[1]
+
+        self.cache = {
+            "query": query,
+            "key": key,
+            "value": value,
+            "Q_raw": Q_raw,
+            "K_raw": K_raw,
+            "V_raw": V_raw,
+            "Q": Q,
+            "K": K,
+            "V": V,
+            "score": score,
+            "mask": mask,
+            "attention": attention_weights,
+            "context_split": context_split,
+            "context": context,
+            "shape": (batch_size, seq_len)
+        }
         return out, attention_weights
+    
+    def backward(self, d_out):
+        cache = self.cache
+        query  = cache["query"]
+        key    = cache["key"]
+        value  = cache["value"]
+
+        Q_raw  = cache["Q_raw"]
+        K_raw  = cache["K_raw"]
+        V_raw  = cache["V_raw"]
+
+        Q      = cache["Q"]
+        K      = cache["K"]
+        V      = cache["V"]
+
+        score  = cache["score"]
+        mask   = cache["mask"]
+        attn   = cache["attention"]
+
+        context_split = cache["context_split"]  # (B, H, T, depth)
+        context       = cache["context"]        # (B, T, d_model)
+
+        batch_size, seq_len = cache["shape"]
+        depth = self.depth
+        H = self.n_heads
+
+        self.d_context = d_out @ self.Wo.T
+        self.dWo = np.tensordot(context, d_out, axes=([0,1], [0,1]))
+        self.dbo = np.sum(d_out, axis=(0,1))
+
+        d_context_reshaped = self.d_context.reshape(batch_size, seq_len, H, depth)
+        d_context_split = np.transpose(d_context_reshaped, (0, 2, 1, 3))
+        self.d_context_split = d_context_split
+
+        self.d_attn = np.matmul(d_context_split, np.transpose(V, (0, 1, 3, 2)))
+        self.d_V_split = np.matmul(np.transpose(attn, (0, 1, 3, 2)), d_context_split)
+
+        s = np.sum(self.d_attn * attn, axis=-1, keepdims=True) 
+        d_score = attn * (self.d_attn - s)   
+        if mask is not None:
+            d_score = np.where(mask, d_score, 0.0)
+        self.d_score = d_score
+
+        scale = 1.0 / np.sqrt(depth)
+        d_Q_split = np.matmul(d_score, K) * scale
+        d_K_split = np.matmul(np.transpose(d_score, (0,1,3,2)), Q) * scale
+        self.d_Q_split = d_Q_split
+        self.d_K_split = d_K_split
+
+        d_Q_transposed = np.transpose(d_Q_split, (0, 2, 1, 3)) 
+        d_Q_raw = d_Q_transposed.reshape(batch_size, seq_len, self.d_model)
+        d_K_transposed = np.transpose(d_K_split, (0, 2, 1, 3)) 
+        d_K_raw = d_K_transposed.reshape(batch_size, seq_len, self.d_model)
+        d_V_transposed = np.transpose(self.d_V_split, (0, 2, 1, 3))  
+        d_V_raw = d_V_transposed.reshape(batch_size, seq_len, self.d_model)
+
+        self.d_Q_raw = d_Q_raw
+        self.d_K_raw = d_K_raw
+        self.d_V_raw = d_V_raw
+
+        self.dWq += np.tensordot(query, d_Q_raw, axes=([0,1],[0,1]))
+        self.dbq += np.sum(d_Q_raw, axis=(0,1))
+        d_query_from_q = d_Q_raw @ self.Wq.T
+
+        self.dWk += np.tensordot(key, d_K_raw, axes=([0,1],[0,1]))
+        self.dbk += np.sum(d_K_raw, axis=(0,1))
+        d_key_from_k = d_K_raw @ self.Wk.T
+
+        self.dWv += np.tensordot(value, d_V_raw, axes=([0,1],[0,1]))
+        self.dbv += np.sum(d_V_raw, axis=(0,1))
+        d_value_from_v = d_V_raw @ self.Wv.T
+
+        dx = d_query_from_q + d_key_from_k + d_value_from_v
+
+        return dx
+    
+    def zero_grad(self):
+        self.dWq[...] = 0
+        self.dbq[...] = 0
+        self.dWk[...] = 0
+        self.dbk[...] = 0
+        self.dWv[...] = 0
+        self.dbv[...] = 0
+        self.dWo[...] = 0
+        self.dbo[...] = 0
+
+        self.d_context = 0
+        self.d_context_split = 0
+        self.d_attn = 0
+        self.d_V_split = 0
+        self.d_score = 0
+        self.d_Q_raw = 0
+        self.d_K_raw = 0
+        self.d_V_raw = 0
+
+
+    def update(self, lr):
+        self.Wq -= lr * self.dWq
+        self.bq -= lr * self.dbq
+        self.Wk -= lr * self.dWk
+        self.bk -= lr * self.dbk
+        self.Wv -= lr * self.dWv
+        self.bv -= lr * self.dbv
+        self.Wo -= lr * self.dWo
+        self.bo -= lr * self.dbo
 
 
 # ======== Positional Encoding ========
@@ -173,23 +285,75 @@ class Encoder:
         self.n_heads = n_heads
         self.d_ff = d_ff
 
+        # 1) Self-attention block
         self.self_attention = MultiheadAttention(d_model, n_heads)
+
+        # 2) Feed-forward block
         self.ff = FeedForward(d_model, d_ff)
+
+        # 3) Two LayerNorms: one after self-attention, one after FFN
+        self.ln1 = LayerNorm(d_model)
+        self.ln2 = LayerNorm(d_model)
+
+        # (later we’ll add: maybe caches for residuals if you want)
 
     def forward(self, x, mask=None):
         """
-        x: (batch_size, seq_len, d_model)
+        x:   (batch_size, seq_len, d_model)
         mask: same semantics as in MultiheadAttention
         """
-        # Self-attention + residual + LN
-        x_hat, _ = self.self_attention.forward(x, x, x, mask)
-        x = layer_norm(x + x_hat)
+        sa_out, _ = self.self_attention.forward(x, x, x, mask)
+        x_sa = x + sa_out 
+        y1 = self.ln1.forward(x_sa)
 
-        # Feed-forward + residual + LN
-        x_hat = self.ff.forward(x)
-        x = layer_norm(x + x_hat)
+        ff_out = self.ff.forward(y1)
+        y1_ff = y1 + ff_out
+        y2 = self.ln2.forward(y1_ff)
 
-        return x
+        self.cache = {
+            "x": x,
+            "x_sa": x_sa,
+            "y1": y1,
+            "y1_ff": y1_ff,
+        }
+
+        return y2
+
+    def backward(self, d_out):
+        cache = self.cache
+
+        dy2 = d_out
+        dy1_ff = self.ln2.backward(dy2)
+
+        d_y1_from_residual2 = dy1_ff
+        d_ff_out = dy1_ff
+
+        dy1_from_ff = self.ff.backward(d_ff_out)
+        dy1 = d_y1_from_residual2 + dy1_from_ff
+
+        dx_sa = self.ln1.backward(dy1)
+
+        d_x_from_residual = dx_sa
+        d_sa_out = dx_sa
+
+        d_x_from_sa = self.self_attention.backward(d_sa_out)
+
+        dx = d_x_from_residual + d_x_from_sa
+        return dx
+    
+    def zero_grad(self):
+        self.self_attention.zero_grad()
+        self.ff.zero_grad()
+        self.ln1.zero_grad()
+        self.ln2.zero_grad()
+
+    def update(self, lr):
+        self.self_attention.update(lr)
+        self.ff.update(lr)
+        self.ln1.update(lr)
+        self.ln2.update(lr)
+
+
 
 
 # ======== Decoder ========
@@ -261,11 +425,24 @@ class Linear:
     def backward(self, dy):
         x = self.cache["x"]
 
-        self.dW = np.tensordot(x, dy, axes=((0,1),(0,1)))
-        self.db = np.sum(dy, axis=(0,1))
+        x2 = x.reshape(-1, self.in_dim)
+        dy2 = dy.reshape(-1, self.out_dim)
+
+        self.dW += x2.T @ dy2
+        self.db += dy2.sum(axis=0)
+
         dx = dy @ self.W.T
 
         return dx
+
+    
+    def zero_grad(self):
+        self.dW[...] = 0
+        self.db[...] = 0
+
+    def update(self, lr):
+        self.W -= lr * self.dW
+        self.b -= lr * self.db
     
 # ======== ReLU ========
     
@@ -316,8 +493,8 @@ class LayerNorm:
         inv_std = self.cache["inv_std"]
 
         # 1. dgamma, dbeta
-        self.dgamma = np.sum(dy * x_hat, axis=(0,1))
-        self.dbeta  = np.sum(dy, axis=(0,1))
+        self.dgamma += np.sum(dy * x_hat, axis=(0,1))
+        self.dbeta  += np.sum(dy, axis=(0,1))
 
         # 2. dx_hat
         dx_hat = dy * self.gamma
