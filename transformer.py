@@ -138,20 +138,32 @@ class FeedForward:
         self.d_model = d_model
         self.d_ff = d_ff
         # Using x @ W1, where x: (..., d_model), W1: (d_model, d_ff)
-        self.W1 = np.random.randn(d_model, d_ff) / np.sqrt(d_model)
-        self.W2 = np.random.randn(d_ff, d_model) / np.sqrt(d_ff)
+        self.linear1 = Linear(d_model, d_ff)
+        self.relu = ReLU()
+        self.linear2 = Linear(d_ff, d_model)
 
-        self.b1 = np.zeros((d_ff,))
-        self.b2 = np.zeros((d_model,))
 
     def forward(self, x):
-        """
-        x: (batch_size, seq_len, d_model)
-        """
-        x = np.dot(x, self.W1) + self.b1  # (batch, seq, d_ff)
-        x = np.maximum(0, x)  # ReLU
-        output = np.dot(x, self.W2) + self.b2  # (batch, seq, d_model)
-        return output
+        h1 = self.linear1.forward(x)
+        h2 = self.relu.forward(h1)
+        out = self.linear2.forward(h2)
+
+        return out
+    
+    def backward(self, d_out):
+        d_h2 = self.linear2.backward(d_out)
+        d_h1 = self.relu.backward(d_h2)
+        d_x  = self.linear1.backward(d_h1)
+
+        return d_x
+    
+    def zero_grad(self):
+        self.linear1.zero_grad()
+        self.linear2.zero_grad()
+
+    def update(self, lr):
+        self.linear1.update(lr)
+        self.linear2.update(lr)
 
 
 # ======== Encoder ========
@@ -225,6 +237,53 @@ class Decoder:
         x = layer_norm(x + x_hat)
 
         return x, attention_weights
+    
+# ======== Linear ========
+class Linear:
+    def __init__(self, in_dim, out_dim):
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+
+        self.W = np.random.randn(in_dim, out_dim)/ np.sqrt(in_dim)
+        self.b = np.zeros((out_dim,))
+
+        self.dW = np.zeros((in_dim, out_dim))
+        self.db = np.zeros((out_dim,))
+
+        self.cache = {}
+        
+    def forward(self, x):
+        self.cache["x"] = x
+        y = x @ self.W + self.b
+
+        return y
+    
+    def backward(self, dy):
+        x = self.cache["x"]
+
+        self.dW = np.tensordot(x, dy, axes=((0,1),(0,1)))
+        self.db = np.sum(dy, axis=(0,1))
+        dx = dy @ self.W.T
+
+        return dx
+    
+# ======== ReLU ========
+    
+class ReLU:
+    def __init__(self):
+        self.cache = {}
+
+    def forward(self, x):
+        # store mask for backward
+        mask = (x > 0)
+        self.cache["mask"] = mask
+        y = np.maximum(0, x)
+        return y
+
+    def backward(self, dy):
+        mask = self.cache["mask"]
+        dx = dy * mask
+        return dx
 
 
 # ======== Tests ========
@@ -454,7 +513,6 @@ def test_gradient_flow():
     assert abs(numerical_gradient) > 1e-10, "Gradient should be non-zero (gradient flow exists)"
     
     print("✓ Gradient flow test passed")
-
 
 def test_full_pipeline():
     """Test a simple end-to-end pipeline"""
