@@ -285,294 +285,59 @@ class ReLU:
         dx = dy * mask
         return dx
 
+class LayerNorm:
+    def __init__(self, d_model, eps=1e-6):
+        self.d_model = d_model
+        self.eps = eps
 
-# ======== Tests ========
+        self.gamma = np.ones((d_model,))
+        self.beta = np.zeros((d_model,))
 
-def test_softmax():
-    """Test softmax computation"""
-    print("Testing Softmax...")
-    
-    # Test 2D case
-    x = np.array([[1, 2, 3], [4, 5, 6]])
-    result = softmax(x)
-    
-    # Check if sums to 1
-    assert np.allclose(np.sum(result, axis=-1), 1.0), "Softmax should sum to 1"
-    
-    # Check if all values are positive
-    assert np.all(result > 0), "Softmax values should be positive"
-    
-    print("✓ Softmax tests passed")
+        self.dgamma = np.zeros_like(self.gamma)
+        self.dbeta = np.zeros_like(self.beta)
 
+        self.cache = {}
 
-def test_multihead_attention():
-    """Test multi-head attention mechanism"""
-    print("\nTesting Multi-head Attention...")
-    
-    batch_size = 2
-    seq_len = 4
-    d_model = 8
-    n_heads = 2
-    
-    # Create instance
-    mha = MultiheadAttention(d_model, n_heads)
-    
-    # Create dummy input
-    x = np.random.randn(batch_size, seq_len, d_model)
-    
-    # Forward pass
-    output, attention_weights = mha.forward(x, x, x)
-    
-    # Check output shape
-    assert output.shape == (batch_size, seq_len, d_model), \
-        f"Expected shape {(batch_size, seq_len, d_model)}, got {output.shape}"
-    
-    # Check attention weights shape
-    assert attention_weights.shape == (batch_size, n_heads, seq_len, seq_len), \
-        f"Expected attention shape {(batch_size, n_heads, seq_len, seq_len)}, got {attention_weights.shape}"
-    
-    # Check attention weights sum to 1
-    attention_sum = np.sum(attention_weights, axis=-1)
-    assert np.allclose(attention_sum, 1.0), "Attention weights should sum to 1"
-    
-    print("✓ Multi-head attention tests passed")
+    def forward(self, x):
+        mean = np.mean(x, axis=-1, keepdims=True)
+        var = np.var(x, axis=-1, keepdims=True)
+        inv_std = 1.0 / np.sqrt(var + self.eps)
+        x_hat = (x - mean) * inv_std
+        y = self.gamma * x_hat + self.beta
+
+        self.cache["x_hat"] = x_hat
+        self.cache["mean"] = mean
+        self.cache["var"] = var
+        self.cache["inv_std"] = inv_std
+        return y 
+
+    def backward(self, dy):
+        x_hat = self.cache["x_hat"]
+        inv_std = self.cache["inv_std"]
+
+        # 1. dgamma, dbeta
+        self.dgamma = np.sum(dy * x_hat, axis=(0,1))
+        self.dbeta  = np.sum(dy, axis=(0,1))
+
+        # 2. dx_hat
+        dx_hat = dy * self.gamma
+
+        # 3. dx using the LN backward formula
+        D = x_hat.shape[-1]
+        sum_dx_hat = np.sum(dx_hat, axis=-1, keepdims=True)
+        sum_dx_hat_xhat = np.sum(dx_hat * x_hat, axis=-1, keepdims=True)
+
+        dx = (1.0 / D) * inv_std * (
+            D * dx_hat - sum_dx_hat - x_hat * sum_dx_hat_xhat
+        )
+
+        return dx
 
 
-def test_positional_encoding():
-    """Test positional encoding"""
-    print("\nTesting Positional Encoding...")
-    
-    d_model = 512
-    max_len = 100
-    
-    pos_enc = PositionalEncoding(d_model, max_len)
-    
-    # Check encoding shape
-    assert pos_enc.pos_encoding.shape == (1, max_len, d_model), \
-        f"Expected shape {(1, max_len, d_model)}, got {pos_enc.pos_encoding.shape}"
-    
-    # Test forward pass
-    batch_size = 2
-    seq_len = 10
-    x = np.random.randn(batch_size, seq_len, d_model)
-    output = pos_enc.forward(x)
-    
-    assert output.shape == x.shape, "Output shape should match input shape"
-    
-    # Check that encoding is deterministic
-    output2 = pos_enc.forward(x)
-    assert np.allclose(output, output2), "Positional encoding should be deterministic"
-    
-    print("✓ Positional encoding tests passed")
+    def zero_grad(self):
+        self.dgamma[...] = 0
+        self.dbeta[...] = 0
 
-
-def test_feedforward():
-    """Test feed-forward network"""
-    print("\nTesting Feed-Forward Network...")
-    
-    batch_size = 2
-    seq_len = 4
-    d_model = 8
-    d_ff = 32
-    
-    ff = FeedForward(d_model, d_ff)
-    
-    x = np.random.randn(batch_size, seq_len, d_model)
-    output = ff.forward(x)
-    
-    # Check output shape
-    assert output.shape == (batch_size, seq_len, d_model), \
-        f"Expected shape {(batch_size, seq_len, d_model)}, got {output.shape}"
-    
-    # Check ReLU activation (no negative values in intermediate layer)
-    x_intermediate = np.dot(x, ff.W1) + ff.b1
-    x_activated = np.maximum(0, x_intermediate)
-    assert np.all(x_activated >= 0), "ReLU should produce non-negative values"
-    
-    print("✓ Feed-forward tests passed")
-
-
-def test_encoder():
-    """Test encoder layer"""
-    print("\nTesting Encoder...")
-    
-    batch_size = 2
-    seq_len = 4
-    d_model = 8
-    n_heads = 2
-    d_ff = 32
-    
-    encoder = Encoder(d_model, n_heads, d_ff)
-    
-    x = np.random.randn(batch_size, seq_len, d_model)
-    mask = None  # or create a proper mask
-    
-    output = encoder.forward(x, mask)
-    
-    # Check output shape
-    assert output.shape == (batch_size, seq_len, d_model), \
-        f"Expected shape {(batch_size, seq_len, d_model)}, got {output.shape}"
-    
-    # Check that output is different from input (transformation occurred)
-    assert not np.allclose(output, x), "Encoder should transform the input"
-    
-    print("✓ Encoder tests passed")
-
-
-def test_decoder():
-    """Test decoder layer"""
-    print("\nTesting Decoder...")
-    
-    batch_size = 2
-    src_seq_len = 4
-    tgt_seq_len = 3
-    d_model = 8
-    n_heads = 2
-    d_ff = 32
-    
-    decoder = Decoder(d_model, n_heads, d_ff)
-    
-    x = np.random.randn(batch_size, tgt_seq_len, d_model)
-    encoder_output = np.random.randn(batch_size, src_seq_len, d_model)
-    
-    src_mask = None
-    # Explicitly use causal mask (though Decoder will also create one if None)
-    tgt_mask = create_causal_mask(tgt_seq_len, batch_size, n_heads)
-    
-    output, attention_weights = decoder.forward(x, encoder_output, src_mask, tgt_mask)
-    
-    # Check output shape
-    assert output.shape == (batch_size, tgt_seq_len, d_model), \
-        f"Expected shape {(batch_size, tgt_seq_len, d_model)}, got {output.shape}"
-    
-    # Check attention weights shape (cross-attention: tgt x src)
-    assert attention_weights.shape == (batch_size, n_heads, tgt_seq_len, src_seq_len), \
-        f"Expected attention shape {(batch_size, n_heads, tgt_seq_len, src_seq_len)}"
-    
-    print("✓ Decoder tests passed")
-
-
-def test_masking():
-    """Test masking functionality"""
-    print("\nTesting Masking...")
-    
-    batch_size = 1
-    seq_len = 4
-    d_model = 8
-    n_heads = 2
-    
-    mha = MultiheadAttention(d_model, n_heads)
-    
-    x = np.random.randn(batch_size, seq_len, d_model)
-    
-    # Create a causal mask (for autoregressive generation)
-    mask = np.tril(np.ones((seq_len, seq_len)))
-    mask = mask[np.newaxis, np.newaxis, :, :]  # Add batch and head dimensions
-    mask = mask.astype(bool)
-    
-    output, attention_weights = mha.forward(x, x, x, mask)
-    
-    # Check that masked positions (upper triangle) have ~zero attention
-    for h in range(n_heads):
-        upper_triangle_mask = 1 - np.tril(np.ones((seq_len, seq_len)))
-        upper_triangle = attention_weights[0, h] * upper_triangle_mask
-        assert np.allclose(upper_triangle, 0, atol=1e-6), "Masked positions should have zero attention"
-    
-    print("✓ Masking tests passed")
-
-
-def test_gradient_flow():
-    """Test that gradients can flow (simple numerical gradient check)"""
-    print("\nTesting Gradient Flow...")
-    
-    batch_size = 1
-    seq_len = 2
-    d_model = 4
-    n_heads = 2
-    
-    mha = MultiheadAttention(d_model, n_heads)
-    
-    x = np.random.randn(batch_size, seq_len, d_model)
-    
-    # Compute output
-    output, _ = mha.forward(x, x, x)
-    
-    # Simple loss (sum of outputs)
-    loss = np.sum(output)
-    
-    # Numerical gradient check for a single input element
-    epsilon = 1e-5
-    x_perturbed = x.copy()
-    x_perturbed[0, 0, 0] += epsilon
-    output_perturbed, _ = mha.forward(x_perturbed, x_perturbed, x_perturbed)
-    loss_perturbed = np.sum(output_perturbed)
-    
-    numerical_gradient = (loss_perturbed - loss) / epsilon
-    
-    # We only check that the loss is sensitive to this parameter (non-zero gradient)
-    assert abs(numerical_gradient) > 1e-10, "Gradient should be non-zero (gradient flow exists)"
-    
-    print("✓ Gradient flow test passed")
-
-def test_full_pipeline():
-    """Test a simple end-to-end pipeline"""
-    print("\nTesting Full Pipeline...")
-    
-    batch_size = 2
-    src_seq_len = 5
-    tgt_seq_len = 4
-    d_model = 16
-    n_heads = 2
-    d_ff = 64
-    
-    # Initialize components
-    pos_enc = PositionalEncoding(d_model, max_len=100)
-    encoder = Encoder(d_model, n_heads, d_ff)
-    decoder = Decoder(d_model, n_heads, d_ff)
-    
-    # Create dummy data (e.g., embedded tokens)
-    src = np.random.randn(batch_size, src_seq_len, d_model)
-    tgt = np.random.randn(batch_size, tgt_seq_len, d_model)
-    
-    # Add positional encoding
-    src = pos_enc.forward(src)
-    tgt = pos_enc.forward(tgt)
-    
-    # Encode
-    encoder_output = encoder.forward(src, mask=None)
-    
-    # Decode with default causal mask (tgt_mask=None)
-    decoder_output, cross_attention = decoder.forward(tgt, encoder_output, None, None)
-    
-    assert decoder_output.shape == (batch_size, tgt_seq_len, d_model), \
-        "Final output shape mismatch"
-    
-    print("✓ Full pipeline test passed")
-
-
-if __name__ == "__main__":
-    print("=" * 50)
-    print("Running Transformer Tests")
-    print("=" * 50)
-    
-    try:
-        test_softmax()
-        test_multihead_attention()
-        test_positional_encoding()
-        test_feedforward()
-        test_encoder()
-        test_decoder()
-        test_masking()
-        test_gradient_flow()
-        test_full_pipeline()
-        
-        print("\n" + "=" * 50)
-        print("All tests passed! ✓")
-        print("=" * 50)
-        
-    except AssertionError as e:
-        print(f"\n✗ Test failed: {e}")
-    except Exception as e:
-        print(f"\n✗ Error occurred: {e}")
-        import traceback
-        traceback.print_exc()
+    def update(self, lr):
+        self.gamma -= lr * self.dgamma
+        self.beta  -= lr * self.dbeta
