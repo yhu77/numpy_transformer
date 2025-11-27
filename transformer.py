@@ -78,16 +78,17 @@ class MultiheadAttention:
         # score: (batch, heads, seq_q, seq_k)
 
         if mask is not None:
-            # Ensure boolean mask: True = keep, False = mask out
             if mask.dtype != bool:
                 mask = mask.astype(bool)
 
-            # Broadcast mask to score shape if needed
             if mask.shape != score.shape:
                 mask = np.broadcast_to(mask, score.shape)
+            mask_bc = mask  
+        else:
+            mask_bc = None
 
-            # Where mask is False, set score to very negative
-            score = np.where(mask, score, -1e9)
+        if mask_bc is not None:
+            score = np.where(mask_bc, score, -1e9)
 
         attention_weights = softmax(score)
         context_split = np.matmul(attention_weights, V)  # (batch, heads, seq_q, depth)
@@ -110,7 +111,7 @@ class MultiheadAttention:
             "K": K,
             "V": V,
             "score": score,
-            "mask": mask,
+            "mask": mask_bc,
             "attention": attention_weights,
             "context_split": context_split,
             "context": context,
@@ -177,21 +178,19 @@ class MultiheadAttention:
         self.d_K_raw = d_K_raw
         self.d_V_raw = d_V_raw
 
-        self.dWq += np.tensordot(query, d_Q_raw, axes=([0,1],[0,1]))
-        self.dbq += np.sum(d_Q_raw, axis=(0,1))
+        self.dWq = np.tensordot(query, d_Q_raw, axes=([0,1],[0,1]))
+        self.dbq = np.sum(d_Q_raw, axis=(0,1))
         d_query_from_q = d_Q_raw @ self.Wq.T
 
-        self.dWk += np.tensordot(key, d_K_raw, axes=([0,1],[0,1]))
-        self.dbk += np.sum(d_K_raw, axis=(0,1))
+        self.dWk = np.tensordot(key, d_K_raw, axes=([0,1],[0,1]))
+        self.dbk = np.sum(d_K_raw, axis=(0,1))
         d_key_from_k = d_K_raw @ self.Wk.T
 
-        self.dWv += np.tensordot(value, d_V_raw, axes=([0,1],[0,1]))
-        self.dbv += np.sum(d_V_raw, axis=(0,1))
+        self.dWv = np.tensordot(value, d_V_raw, axes=([0,1],[0,1]))
+        self.dbv = np.sum(d_V_raw, axis=(0,1))
         d_value_from_v = d_V_raw @ self.Wv.T
 
-        dx = d_query_from_q + d_key_from_k + d_value_from_v
-
-        return dx
+        return d_query_from_q, d_key_from_k, d_value_from_v
     
     def zero_grad(self):
         self.dWq[...] = 0
@@ -241,6 +240,9 @@ class PositionalEncoding:
         """
         x = x + self.pos_encoding[:, :x.shape[1], :]
         return x
+    
+    def backward(self, d_out):
+        return d_out
 
 
 # ======== Feed Forward ========
@@ -335,9 +337,8 @@ class Encoder:
         d_x_from_residual = dx_sa
         d_sa_out = dx_sa
 
-        d_x_from_sa = self.self_attention.backward(d_sa_out)
-
-        dx = d_x_from_residual + d_x_from_sa
+        dQ, dK, dV = self.self_attention.backward(d_sa_out)
+        dx = d_x_from_residual + dQ + dK + dV
         return dx
     
     def zero_grad(self):
@@ -427,11 +428,13 @@ class Decoder:
         d_ca_out = dy1_ca
 
         # cross-attention backward
-        dy1_from_ca = self.cross_attention.backward(d_ca_out)
+        dQ, dK, dV = self.cross_attention.backward(d_ca_out)
 
-        # sum residuals
-        dy1 = d_y1_from_residual2 + dy1_from_ca
+        # decoder receives only dQ
+        dy1 = d_y1_from_residual2 + dQ
 
+        # encoder receives both dK and dV
+        d_enc_from_cross = dK + dV
 
         # ---------- Block 1: Masked Self Attention block ----------
         # LN1 backward
@@ -442,12 +445,10 @@ class Decoder:
         d_sa_out = dx_sa
 
         # masked self-attention backward
-        d_x_from_sa = self.self_attention.backward(d_sa_out)
+        dQ, dK, dV = self.self_attention.backward(d_sa_out)
+        dx = d_x_from_residual1 + dQ + dK + dV
 
-        # final gradient to input
-        dx = d_x_from_residual1 + d_x_from_sa
-
-        return dx
+        return dx, d_enc_from_cross
     
     def zero_grad(self):
         self.self_attention.zero_grad()
@@ -495,8 +496,8 @@ class Linear:
         x2 = x.reshape(-1, self.in_dim)
         dy2 = dy.reshape(-1, self.out_dim)
 
-        self.dW += x2.T @ dy2
-        self.db += dy2.sum(axis=0)
+        self.dW = x2.T @ dy2
+        self.db = dy2.sum(axis=0)
 
         dx = dy @ self.W.T
 
@@ -560,8 +561,8 @@ class LayerNorm:
         inv_std = self.cache["inv_std"]
 
         # 1. dgamma, dbeta
-        self.dgamma += np.sum(dy * x_hat, axis=(0,1))
-        self.dbeta  += np.sum(dy, axis=(0,1))
+        self.dgamma = np.sum(dy * x_hat, axis=(0,1))
+        self.dbeta  = np.sum(dy, axis=(0,1))
 
         # 2. dx_hat
         dx_hat = dy * self.gamma
