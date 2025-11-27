@@ -19,13 +19,29 @@ def create_causal_mask(seq_len, batch_size=1, n_heads=1):
     return mask[np.newaxis, np.newaxis, :, :]
 
 def cross_entropy_loss(logits, target_ids):
-        logits_max = np.max(logits, axis=-1, keepdims=True)
-        logits_stable = logits - logits_max
-        probs = softmax
-        probs = softmax(logits)
-        d_logits = probs
-        d_logits[target_ids] -= 1
+    B, T, V = logits.shape
+
+    logits_max = np.max(logits, axis=-1, keepdims=True)
+    logits_stable = logits - logits_max
+    exp_logits = np.exp(logits_stable)
+    sum_exp = np.sum(exp_logits, axis=-1, keepdims=True)
+    probs = exp_logits / sum_exp
+
+    log_probs = logits_stable - np.log(sum_exp)
+
+    batch_idx = np.arange(B)[:, None]
+    time_idx = np.arange(T)[None, :]
+
+    log_probs_target = log_probs[batch_idx, time_idx, target_ids]
+
+    loss = -np.mean(log_probs_target)
+
+    d_logits = probs.copy()
+    d_logits[batch_idx, time_idx, target_ids] -= 1.0
+    d_logits /= (B * T)
+
     return loss, d_logits
+
 
 
 # ======== Multihead Attention ========
@@ -413,47 +429,31 @@ class Decoder:
         return y3, attn
     
     def backward(self, d_out):
-        # ---------- Block 3: Feed Forward block ----------
-        # LN3 backward
         dy2_ff = self.ln3.backward(d_out)
 
-        # residual split
         d_y2_from_residual3 = dy2_ff
         d_ff_out = dy2_ff
 
-        # FF backward
         dy2_from_ff = self.ff.backward(d_ff_out)
 
-        # sum residuals
         dy2 = d_y2_from_residual3 + dy2_from_ff
 
-
-        # ---------- Block 2: Cross Attention block ----------
-        # LN2 backward
         dy1_ca = self.ln2.backward(dy2)
 
-        # residual split
         d_y1_from_residual2 = dy1_ca
         d_ca_out = dy1_ca
 
-        # cross-attention backward
         dQ, dK, dV = self.cross_attention.backward(d_ca_out)
 
-        # decoder receives only dQ
         dy1 = d_y1_from_residual2 + dQ
 
-        # encoder receives both dK and dV
         d_enc_from_cross = dK + dV
 
-        # ---------- Block 1: Masked Self Attention block ----------
-        # LN1 backward
         dx_sa = self.ln1.backward(dy1)
 
-        # residual split
         d_x_from_residual1 = dx_sa
         d_sa_out = dx_sa
 
-        # masked self-attention backward
         dQ, dK, dV = self.self_attention.backward(d_sa_out)
         dx = d_x_from_residual1 + dQ + dK + dV
 
@@ -650,3 +650,30 @@ class Transformer:
         logits = self.output_projection.forward(dec_out)
 
         return logits
+    
+    def backward(self, d_logits):
+        d_dec_out = self.output_projection.backward(d_logits)
+        d_tgt_emb, d_enc_from_dec = self.decoder.backward(d_dec_out)
+        d_src_emb = self.encoder.backward(d_enc_from_dec)
+
+        d_tgt_emb = self.pos_encoding.backward(d_tgt_emb)
+        d_src_emb = self.pos_encoding.backward(d_src_emb)
+
+        self.tgt_embedding.backward(d_tgt_emb)
+        self.src_embedding.backward(d_src_emb)
+
+    def zero_grad(self):
+        self.src_embedding.zero_grad()
+        self.tgt_embedding.zero_grad()
+        self.encoder.zero_grad()
+        self.decoder.zero_grad()
+        self.output_projection.zero_grad()
+
+    def update(self, lr):
+        self.src_embedding.update(lr)
+        self.tgt_embedding.update(lr)
+        self.encoder.update(lr)
+        self.decoder.update(lr)
+        self.output_projection.update(lr)
+
+
