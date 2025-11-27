@@ -586,3 +586,26 @@ class LayerNorm:
     def update(self, lr):
         self.gamma -= lr * self.dgamma
         self.beta  -= lr * self.dbeta
+
+class Embedding:
+    def __init__(self, vocab_size, d_model):
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.W = np.random.randn(vocab_size, d_model) / np.sqrt(d_model)
+        self.dW = np.zeros_like(self.W)
+
+    def forward(self, token_ids):
+        self.cache = {"token_ids": token_ids}
+        return self.W[token_ids]
+    
+    def backward(self, d_out):
+        token_ids = self.cache["token_ids"]
+        self.dW = np.zeros_like(self.W)
+        np.add.at(self.dW, token_ids, d_out)
+        return None
+    
+    def zero_grad(self):
+        self.dW[...] = 0
+
+    def update(self, lr):
+        self.W -= lr * self.dW
