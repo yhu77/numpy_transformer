@@ -18,6 +18,15 @@ def create_causal_mask(seq_len, batch_size=1, n_heads=1):
     # (1, 1, seq_len, seq_len) – will broadcast to (batch, heads, seq_len, seq_len)
     return mask[np.newaxis, np.newaxis, :, :]
 
+def cross_entropy_loss(logits, target_ids):
+        logits_max = np.max(logits, axis=-1, keepdims=True)
+        logits_stable = logits - logits_max
+        probs = softmax
+        probs = softmax(logits)
+        d_logits = probs
+        d_logits[target_ids] -= 1
+    return loss, d_logits
+
 
 # ======== Multihead Attention ========
 class MultiheadAttention:
@@ -609,3 +618,35 @@ class Embedding:
 
     def update(self, lr):
         self.W -= lr * self.dW
+
+class Transformer:
+    def __init__(self, src_vocab_size, tgt_vocab_size, d_model, n_heads, d_ff, max_len=128):
+        self.src_vocab_size = src_vocab_size
+        self.tgt_vocab_size = tgt_vocab_size
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.d_ff = d_ff
+        self.max_len = max_len
+
+        self.src_embedding = Embedding(src_vocab_size, d_model)
+        self.tgt_embedding = Embedding(tgt_vocab_size, d_model)
+
+        self.pos_encoding = PositionalEncoding(d_model, max_len=max_len)
+
+        self.encoder = Encoder(d_model, n_heads, d_ff)
+        self.decoder = Decoder(d_model, n_heads, d_ff)
+
+        self.output_projection = Linear(d_model, tgt_vocab_size)
+
+    def forward(self, src_ids, tgt_ids, src_mask=None, tgt_mask=None):
+        src_emb = self.src_embedding.forward(src_ids)
+        src_emb = self.pos_encoding.forward(src_emb)
+        enc_out = self.encoder.forward(src_emb, src_mask)
+
+        tgt_emb = self.tgt_embedding.forward(tgt_ids)
+        tgt_emb = self.pos_encoding.forward(tgt_emb)
+        dec_out, attn = self.decoder.forward(tgt_emb, enc_out, src_mask, tgt_mask)
+
+        logits = self.output_projection.forward(dec_out)
+
+        return logits
